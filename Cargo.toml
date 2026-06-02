@@ -1,0 +1,18 @@
+[package]
+name = "mirror"
+version = "0.1.0"
+edition = "2024"
+description = "Mirror a local folder to a remote machine over the CE mesh — edit locally, build remotely."
+license = "MIT"
+repository = "https://github.com/ce-net/mirror"
+
+[dependencies]
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+notify = "6"
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+dirs = "5"
