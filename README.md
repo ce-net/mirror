@@ -1,97 +1,15 @@
-# mirror
+# mirror — DEPRECATED (superseded by `rdev`)
 
-Mirror a local folder to a remote machine **over the CE mesh**. Edit on your laptop, build and
-test on a remote box — even when both are behind NAT.
+This app is retired. It depended on CE node features (`PUT/DELETE /mesh-sync`) that were **removed
+from CE** when device-to-device file sync moved out of the node into an application — the correct
+side of the CE primitives-vs-apps boundary.
 
-`mirror` is an application built **on top of CE**, not part of it. CE is the infrastructure: it
-provides the file-transport primitive (`PUT /mesh-sync/:node_id/*path`, exposed in the `ce-rs` SDK
-as `mesh_sync_file`) that signs each write and routes it over libp2p, traversing the target's NAT
-via the relay. `mirror` owns the application policy: which files to send, when, what to ignore, and
-how local paths map onto the remote machine.
-
-## Why
-
-Your laptop's disk is full and compiling Rust locally is painful. Keep editing on the laptop, but
-run the heavy `cargo build` / tests on a desktop with room and a GPU. `mirror watch` keeps the
-desktop's copy of your source current; you run the build there (`ce exec desktop -- cargo build`,
-or an SSH session).
-
-## How it relates to CE
-
-- **CE provides:** the mesh, NAT traversal (relay + DCUtR), node identity/auth, and the
-  `mesh_sync_file` transport. None of that lives here.
-- **mirror provides:** directory walking, ignore rules (`target/`, `.git`, editor temp files),
-  path mapping, an initial full sync, and a debounced filesystem watcher.
-
-This is the same split as `swarm`: CE is the substrate, apps build on it through `ce-rs`.
-
-## Install
+**Use [`rdev`](https://github.com/ce-net/rdev) instead.** Its `rdev watch` is the continuous 1:1
+folder mirror this app provided (now built on CE primitives: `AppRequest` + the `ce-cap` verifier,
+no node code), plus remote `exec`, `push`, and `rm`.
 
 ```bash
-cargo install --path .
-# or
-cargo build --release   # -> target/release/mirror
+rdev watch ~/ce-net desktop:ce-net    # what `mirror watch` used to do
 ```
 
-Build it on a machine with disk to spare. The binary runs wherever the files you edit live (i.e.
-the laptop — that's where the watcher runs and pushes from).
-
-## Prerequisites (one-time)
-
-1. A CE node running locally: `ce start`. `mirror` talks to its HTTP API.
-2. The target machine's node running and reachable through the relay.
-3. The target must **trust this node** for sync. On the target machine:
-   ```bash
-   ce devices add laptop <this-node-id>
-   ```
-   `<this-node-id>` is your local node's id (`ce id` / `GET /status`).
-
-## Configure
-
-```bash
-mirror init        # writes an example config with a `desktop` alias prefilled
-```
-
-Config lives at `~/.config/mirror/config.toml` (or your platform's config dir):
-
-```toml
-[node]
-# Local CE node HTTP API. Default node port is 8844; this laptop's node currently runs on 8080.
-url = "http://127.0.0.1:8080"
-
-[alias.desktop]
-node_id = "25df8f15853855c4cd2c5769cbc9789bf156534356ffead3b67c2c395f6d8ac1"
-hint = "/ip4/178.105.145.170/tcp/4001/p2p/.../p2p-circuit/p2p/..."   # optional relay dial hint
-cap  = "<token from: ce grant <laptop-node-id> --can sync,delete --expires 90d>"   # required
-```
-
-The `cap` is a capability the **target** issued to this machine (`ce grant … --can sync,delete`),
-authorizing sync + delete there. See `ce/docs/capabilities.md`.
-
-## Use
-
-```bash
-# One-shot push
-mirror push ./ce desktop:ce-net/ce
-
-# Continuous: full sync, then watch and push changes as you save
-mirror watch ./ce desktop:ce-net/ce
-
-# Without an alias, pass a 64-hex node id directly
-mirror watch ./ce 25df...ac1:ce-net/ce --hint /ip4/.../p2p-circuit/p2p/...
-
-# Point at a node on a non-default port
-mirror --node http://127.0.0.1:8080 watch ./ce desktop:ce-net/ce
-```
-
-The remote directory is **relative to the target's home** (`ce-net/ce` → `~/ce-net/ce`).
-
-## Behavior & limitations (v0)
-
-- **One-way** (local → remote) but a **true 1:1 mirror**: created/modified files are pushed, and
-  local deletions/renames are propagated (the old remote path is deleted). Needs a capability with
-  both `sync` and `delete` abilities.
-- Ignored, by name, at every level: `target`, `.git`, `node_modules`, `.DS_Store`, and editor temp
-  files (`*~`, `*.swp`, `*.swo`, `*.tmp`, `.#*`). `.gitignore` is not parsed yet.
-- The local CE node must be running; remote ops fail if the target is offline or the capability is
-  missing/insufficient.
+This repository is archived. History is preserved for reference only.
