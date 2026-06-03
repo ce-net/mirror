@@ -62,7 +62,11 @@ url = "http://127.0.0.1:8080"
 [alias.desktop]
 node_id = "25df8f15853855c4cd2c5769cbc9789bf156534356ffead3b67c2c395f6d8ac1"
 hint = "/ip4/178.105.145.170/tcp/4001/p2p/.../p2p-circuit/p2p/..."   # optional relay dial hint
+cap  = "<token from: ce grant <laptop-node-id> --can sync,delete --expires 90d>"   # required
 ```
+
+The `cap` is a capability the **target** issued to this machine (`ce grant … --can sync,delete`),
+authorizing sync + delete there. See `ce/docs/capabilities.md`.
 
 ## Use
 
@@ -82,12 +86,12 @@ mirror --node http://127.0.0.1:8080 watch ./ce desktop:ce-net/ce
 
 The remote directory is **relative to the target's home** (`ce-net/ce` → `~/ce-net/ce`).
 
-## Limitations (v0)
+## Behavior & limitations (v0)
 
-- **One-way** (local → remote) and **additive**: created/modified files are pushed; local
-  **deletions are not propagated** (the mesh transport has no remote-delete primitive yet). Clean
-  stale remote files by hand if a build needs it.
+- **One-way** (local → remote) but a **true 1:1 mirror**: created/modified files are pushed, and
+  local deletions/renames are propagated (the old remote path is deleted). Needs a capability with
+  both `sync` and `delete` abilities.
 - Ignored, by name, at every level: `target`, `.git`, `node_modules`, `.DS_Store`, and editor temp
   files (`*~`, `*.swp`, `*.swo`, `*.tmp`, `.#*`). `.gitignore` is not parsed yet.
-- The local CE node must be running; remote pushes fail if the target is offline or doesn't trust
-  this node.
+- The local CE node must be running; remote ops fail if the target is offline or the capability is
+  missing/insufficient.

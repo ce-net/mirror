@@ -10,12 +10,13 @@
 //! and test on a beefier desktop. `mirror watch` keeps the desktop's copy of your source current;
 //! you run the actual compile there with `ce exec <desktop> -- cargo build` (or an SSH session).
 //!
-//! Direction is one-way (laptop -> desktop) and additive: created/modified files are pushed;
-//! local deletions are *not* propagated (the mesh transport has no remote-delete primitive yet).
-//! Stale files on the remote rarely break a build; clean them by hand if needed.
+//! Direction is one-way (laptop -> desktop) but a **true 1:1 mirror**: created/modified files are
+//! pushed, and local deletions/renames are propagated (the old path is deleted remotely), so the
+//! remote tree matches the local one.
 //!
 //! Prerequisites (one-time):
 //!   - A CE node running locally (`ce start`) — mirror talks to its HTTP API.
+//!   - A capability from the target authorizing `sync` + `delete` (set `cap` in the alias).
 //!   - The target machine's node running and reachable through the relay.
 //!   - The target must trust this node for sync. On the target: `ce devices add <name> <this-node-id>`.
 
@@ -57,6 +58,9 @@ enum Cmd {
         /// Relay circuit multiaddr dial hint (overrides the alias's configured hint).
         #[arg(long)]
         hint: Option<String>,
+        /// Capability token from `ce grant` (overrides the alias's configured cap).
+        #[arg(long)]
+        cap: Option<String>,
     },
     /// Continuous: full sync once, then watch <dir> and push each change as it happens.
     Watch {
@@ -67,6 +71,9 @@ enum Cmd {
         /// Relay circuit multiaddr dial hint (overrides the alias's configured hint).
         #[arg(long)]
         hint: Option<String>,
+        /// Capability token from `ce grant` (overrides the alias's configured cap).
+        #[arg(long)]
+        cap: Option<String>,
     },
     /// Write an example config (aliases + node URL) to the config path.
     Init,
@@ -96,12 +103,17 @@ struct Alias {
     node_id: String,
     #[serde(default)]
     hint: Option<String>,
+    /// Capability token (from `ce grant` on the target) authorizing sync + delete here.
+    #[serde(default)]
+    cap: Option<String>,
 }
 
 /// A fully resolved destination.
 struct Target {
     node_id: String,
     hint: Option<String>,
+    /// Capability token authorizing sync/delete on the target (needs `sync` + `delete` abilities).
+    cap: Option<String>,
     /// Remote directory, normalised to be relative to the target's home (no leading `~/` or `/`).
     remote_root: String,
 }
@@ -127,14 +139,14 @@ async fn main() -> Result<()> {
     }
 
     match cli.cmd {
-        Cmd::Push { dir, target, hint } => {
-            let t = resolve_target(&target, hint, &cfg)?;
+        Cmd::Push { dir, target, hint, cap } => {
+            let t = resolve_target(&target, hint, cap, &cfg)?;
             let root = canonical(&dir)?;
             let sent = full_sync(&client, &t, &root).await?;
             println!("pushed {sent} files to {}:{}", short(&t.node_id), t.remote_root);
         }
-        Cmd::Watch { dir, target, hint } => {
-            let t = resolve_target(&target, hint, &cfg)?;
+        Cmd::Watch { dir, target, hint, cap } => {
+            let t = resolve_target(&target, hint, cap, &cfg)?;
             let root = canonical(&dir)?;
             let sent = full_sync(&client, &t, &root).await?;
             println!("initial sync: {sent} files");
@@ -164,7 +176,7 @@ async fn full_sync(client: &CeClient, t: &Target, root: &Path) -> Result<usize> 
         let bytes = std::fs::read(entry.path()).with_context(|| format!("read {}", rel.display()))?;
         let remote = remote_path(&t.remote_root, rel);
         client
-            .mesh_sync_file(&t.node_id, &remote, bytes, t.hint.as_deref())
+            .mesh_sync_file(&t.node_id, &remote, bytes, t.cap.as_deref(), t.hint.as_deref())
             .await
             .with_context(|| format!("push {} to {}", rel.display(), short(&t.node_id)))?;
         sent += 1;
@@ -185,7 +197,7 @@ async fn watch(client: &CeClient, t: &Target, root: &Path) -> Result<()> {
     watcher.watch(root, RecursiveMode::Recursive).with_context(|| format!("watch {}", root.display()))?;
 
     println!(
-        "watching {} -> {}:{}  (Ctrl-C to stop; deletions are not propagated)",
+        "watching {} -> {}:{}  (Ctrl-C to stop; a true 1:1 mirror — deletes propagate)",
         root.display(),
         short(&t.node_id),
         t.remote_root
@@ -214,20 +226,30 @@ async fn watch(client: &CeClient, t: &Target, root: &Path) -> Result<()> {
             if rel.as_os_str().is_empty() || rel_is_ignored(rel) {
                 continue;
             }
+            let remote = remote_path(&t.remote_root, rel);
             if p.is_file() {
                 match std::fs::read(&p) {
                     Ok(bytes) => {
-                        let remote = remote_path(&t.remote_root, rel);
-                        match client.mesh_sync_file(&t.node_id, &remote, bytes, t.hint.as_deref()).await {
+                        match client
+                            .mesh_sync_file(&t.node_id, &remote, bytes, t.cap.as_deref(), t.hint.as_deref())
+                            .await
+                        {
                             Ok(()) => println!("  synced {}", rel.display()),
                             Err(e) => eprintln!("  WARN {}: {e}", rel.display()),
                         }
                     }
-                    // File vanished between the event and the read — nothing to push.
+                    // File vanished between the event and the read — fall through to delete it remotely.
                     Err(_) => {}
                 }
             } else if !p.exists() {
-                eprintln!("  note: {} removed locally (not propagated)", rel.display());
+                // Removed (or renamed away) locally — propagate the delete for a true 1:1 mirror.
+                match client
+                    .mesh_delete_file(&t.node_id, &remote, t.cap.as_deref(), t.hint.as_deref())
+                    .await
+                {
+                    Ok(()) => println!("  deleted {}", rel.display()),
+                    Err(e) => eprintln!("  WARN delete {}: {e}", rel.display()),
+                }
             }
         }
     }
@@ -236,15 +258,24 @@ async fn watch(client: &CeClient, t: &Target, root: &Path) -> Result<()> {
 
 /// Resolve `<node-id-or-alias>:<remote-dir>` against the config. A 64-hex left side is used
 /// verbatim; otherwise it's looked up as an alias.
-fn resolve_target(spec: &str, cli_hint: Option<String>, cfg: &Config) -> Result<Target> {
+fn resolve_target(
+    spec: &str,
+    cli_hint: Option<String>,
+    cli_cap: Option<String>,
+    cfg: &Config,
+) -> Result<Target> {
     let (left, right) = spec
         .split_once(':')
         .ok_or_else(|| anyhow!("target must be <node-id-or-alias>:<remote-dir>, e.g. desktop:ce-net/ce"))?;
 
-    let (node_id, hint) = if is_hex64(left) {
-        (left.to_string(), cli_hint)
+    let (node_id, hint, cap) = if is_hex64(left) {
+        (left.to_string(), cli_hint, cli_cap)
     } else if let Some(a) = cfg.alias.get(left) {
-        (a.node_id.clone(), cli_hint.or_else(|| a.hint.clone()))
+        (
+            a.node_id.clone(),
+            cli_hint.or_else(|| a.hint.clone()),
+            cli_cap.or_else(|| a.cap.clone()),
+        )
     } else {
         return Err(anyhow!(
             "unknown alias '{left}'. Add it under [alias.{left}] in {}, or pass a 64-hex node id.",
@@ -252,7 +283,7 @@ fn resolve_target(spec: &str, cli_hint: Option<String>, cfg: &Config) -> Result<
         ));
     };
 
-    Ok(Target { node_id, hint, remote_root: normalize_remote(right) })
+    Ok(Target { node_id, hint, cap, remote_root: normalize_remote(right) })
 }
 
 /// Build the remote path for `rel`, joined under the (home-relative) remote root, using `/` always.
@@ -347,7 +378,10 @@ url = "http://127.0.0.1:8080"
 
 # Aliases let you write `mirror watch ./ce desktop:ce-net/ce` instead of pasting a 64-hex node id.
 # `hint` is an optional relay circuit multiaddr that speeds up the first dial to a NAT'd peer.
+# `cap` is the capability token from `ce grant <this-node-id> --can sync,delete` on the target —
+# required, since the target authorizes sync/delete by capability (see ce/docs/capabilities.md).
 [alias.desktop]
 node_id = "25df8f15853855c4cd2c5769cbc9789bf156534356ffead3b67c2c395f6d8ac1"
 hint = "/ip4/178.105.145.170/tcp/4001/p2p/12D3KooWC6vyMMrtmdWEdpcMx7JZ4Ze5scUhA6BbMdYqnUDC7nr7/p2p-circuit/p2p/12D3KooWCNCyEFHAGE2z4ZhpP6ApeqFXY7cRLxJqVTWvYCBfrWmn"
+# cap = "<paste the token from: ce grant <laptop-node-id> --can sync,delete --expires 90d>"
 "#;
